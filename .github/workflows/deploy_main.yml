@@ -1,0 +1,168 @@
+name: Deploy to AWS - Main Branch
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    environment: main
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ vars.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-south-2
+
+      - name: Git Pull
+        env:
+          INSTANCE_ID: ${{ vars.AWS_INSTANCE_ID }}
+        run: |
+          COMMAND_OUTPUT=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "set -e",
+              "sudo -u ubuntu bash -c '\''",
+              "export HOME=/home/ubuntu",
+              "source $HOME/.bashrc",
+              "echo 📥 Actualizando código...",
+              "cd /home/ubuntu/js_vertor",
+              "git checkout -- .",
+              "git checkout main",
+              "git pull origin main",
+              "'\''\"
+            ]' \
+            --output json)
+
+          COMMAND_ID=$(echo "$COMMAND_OUTPUT" | jq -r '.Command.CommandId')
+          echo "Comando enviado con ID: $COMMAND_ID"
+
+          MAX_ATTEMPTS=10
+          ATTEMPT=0
+          LAST_LINE_COUNT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            OUTPUT=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region eu-south-2 2>/dev/null || echo "{}")
+
+            STATUS=$(echo "$OUTPUT" | jq -r '.Status // "InProgress"')
+            STDOUT=$(echo "$OUTPUT" | jq -r '.StandardOutputContent // ""')
+
+            if [ ! -z "$STDOUT" ]; then
+              CURRENT_LINE_COUNT=$(echo "$STDOUT" | wc -l)
+              if [ $CURRENT_LINE_COUNT -gt $LAST_LINE_COUNT ]; then
+                echo "$STDOUT" | tail -n +$((LAST_LINE_COUNT + 1))
+                LAST_LINE_COUNT=$CURRENT_LINE_COUNT
+              fi
+            fi
+
+            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ]; then
+              FINAL_STATUS=$STATUS
+              break
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 10
+          done
+
+          if [ "$FINAL_STATUS" != "Success" ]; then
+            echo "❌ Error en Git Pull"
+            echo "$OUTPUT" | jq -r '.StandardErrorContent // ""'
+            exit 1
+          fi
+
+      - name: Deploy
+        env:
+          INSTANCE_ID: ${{ vars.AWS_INSTANCE_ID }}
+        run: |
+          COMMAND_OUTPUT=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "sudo -u ubuntu bash -c '\''",
+              "export HOME=/home/ubuntu",
+              "export PATH=$HOME/.nvm/versions/node/*/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+              "source $HOME/.nvm/nvm.sh",
+              "source $HOME/.bashrc",
+              "echo 🚀 Deploy...",
+              "cd /home/ubuntu/js_vertor",
+              "set -a",
+              "source .env",
+              "set +a",
+              "yarn install --immutable",
+              "yarn migrate:deploy",
+              "yarn prisma:generate",
+              "yarn build",
+              "pm2 restart rag",
+              "sleep 3",
+              "echo 🎉 Deploy completado exitosamente!",
+              "'\''\"
+            ]' \
+            --output json)
+
+          COMMAND_ID=$(echo "$COMMAND_OUTPUT" | jq -r '.Command.CommandId')
+          echo "Comando enviado con ID: $COMMAND_ID"
+
+          MAX_ATTEMPTS=50
+          ATTEMPT=0
+          LAST_LINE_COUNT=0
+          HAS_BLOCKING_ERROR=false
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            OUTPUT=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region eu-south-2 2>/dev/null || echo "{}")
+
+            STATUS=$(echo "$OUTPUT" | jq -r '.Status // "InProgress"')
+            STDOUT=$(echo "$OUTPUT" | jq -r '.StandardOutputContent // ""')
+            STDERR=$(echo "$OUTPUT" | jq -r '.StandardErrorContent // ""')
+
+            if [ ! -z "$STDOUT" ]; then
+              CURRENT_LINE_COUNT=$(echo "$STDOUT" | wc -l)
+              if [ $CURRENT_LINE_COUNT -gt $LAST_LINE_COUNT ]; then
+                echo "$STDOUT" | tail -n +$((LAST_LINE_COUNT + 1))
+                LAST_LINE_COUNT=$CURRENT_LINE_COUNT
+              fi
+            fi
+
+            if [ ! -z "$STDERR" ]; then
+              FILTERED_ERROR=$(echo "$STDERR" | grep -v -E '^(warning|⚠|npm WARN|DEP|CVE|found .* vulnerabilities|Loaded Prisma|Prisma schema loaded)' || true)
+              if [ ! -z "$FILTERED_ERROR" ]; then
+                echo "⚠️  Warnings (no bloqueantes):"
+                echo "$STDERR"
+                if echo "$STDERR" | grep -qE '(Error|error:|FATAL|failed|Failed)' && ! echo "$STDERR" | grep -qE '(warning|npm WARN)'; then
+                  echo "❌ Error bloqueante detectado"
+                  HAS_BLOCKING_ERROR=true
+                fi
+              fi
+            fi
+
+            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ]; then
+              FINAL_STATUS=$STATUS
+              break
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 10
+          done
+
+          if [ "$FINAL_STATUS" != "Success" ] || [ "$HAS_BLOCKING_ERROR" = true ]; then
+            echo "❌ Error en Deploy Backend"
+            exit 1
+          fi
